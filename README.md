@@ -45,8 +45,8 @@ Test set：34,493 片（29,397 normal / 5,096 anomaly）。詳見 [docs/tier1.md
 `data/processed/*.npz`（已 resize 成 64×64，約 38 MB）**已經在 repo 裡**，clone 下來就能直接訓練，不需要下載原始資料。
 
 ```bash
-git clone <REPO_URL>
-cd <REPO_NAME>
+git clone https://github.com/justinlin9299/DM-HW2.git
+cd DM-HW2
 pip install -r requirements.txt
 ```
 
