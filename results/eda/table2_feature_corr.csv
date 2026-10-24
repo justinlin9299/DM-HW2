@@ -1,0 +1,5 @@
+,fail_rate,edge_fail_rate,center_fail_rate,dieSize
+fail_rate,1.0000,0.9117,0.7793,-0.5698
+edge_fail_rate,0.9117,1.0000,0.5999,-0.4566
+center_fail_rate,0.7793,0.5999,1.0000,-0.5780
+dieSize,-0.5698,-0.4566,-0.5780,1.0000

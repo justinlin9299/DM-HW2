@@ -1,0 +1,23 @@
+# Raw / cleaned data (~2 GB each, over GitHub's 100 MB limit) -> download with scripts/download_data.py
+data/*.pkl
+data/*.zip
+
+# Preprocessed arrays ARE committed (~38 MB total)
+!data/processed/
+!data/processed/*.npz
+
+# Course material (not ours to redistribute)
+DM-HW2.pptx
+
+# Python / Jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
