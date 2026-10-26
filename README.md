@@ -33,10 +33,11 @@ NYCU Data Mining HW2 — Anomaly Detection｜Team `<TEAM_ID>`
 |---|---|---:|---:|---:|---:|---:|
 | 1 | Predict-all-normal | 0.148 | 0.500 | 0.000 | 0.000 | 0.000 |
 | 1 | Fail-rate threshold（τ = val best-F1） | 0.474 | 0.748 | 0.423 | 0.407 | 0.089 |
-| 2 | TODO | | | | | |
+| 2 | CNN＋合成 defect（只用 train normal） | **0.818 ± 0.014** | **0.934 ± 0.009** | **0.748 ± 0.008** | **0.735 ± 0.013** | **0.040 ± 0.005** |
+| 2 | ablation：Conv Autoencoder | 0.462 ± 0.048 | 0.703 ± 0.047 | 0.428 ± 0.049 | 0.339 ± 0.059 | 0.041 ± 0.009 |
 | 3 | TODO | | | | | |
 
-Test set：34,493 片（29,397 normal / 5,096 anomaly）。詳見 [docs/tier1.md](docs/tier1.md)。
+Test set：34,493 片（29,397 normal / 5,096 anomaly）。Tier 2 為 3 個 seed 的 mean ± std，τ 一律在 val 上以 best-F1 選擇。詳見 [docs/tier1.md](docs/tier1.md)、[docs/tier2.md](docs/tier2.md)。
 
 ---
 
@@ -100,7 +101,8 @@ print(per_type_recall(ft_test, scores_test, tau))
 │   ├── preprocess.py          # resize → npz
 │   ├── data.py                # load_split / to_onehot / to_fail_mask
 │   ├── evaluate.py            # 共用評估函式（三個 tier 都要用）
-│   └── tier1_baseline.py      # Tier 1
+│   ├── tier1_baseline.py      # Tier 1
+│   └── CNN.py                 # Tier 2（在 Colab GPU 上訓練）
 ├── scripts/
 │   └── download_data.py       # 從 Kaggle 下載原始資料
 ├── notebooks/
@@ -108,10 +110,12 @@ print(per_type_recall(ft_test, scores_test, tau))
 │   └── 02_eda.ipynb
 ├── figures/                   # paper 用圖（PNG + PDF）
 │   ├── eda/
-│   └── preprocessing/
+│   ├── preprocessing/
+│   └── tier2/
 ├── results/                   # 各步驟的數值結果（CSV）
 │   ├── eda/
-│   └── tier1/
+│   ├── tier1/
+│   └── tier2/                 # synth/（主方法）、ae/（ablation），含模型權重
 └── docs/                      # 各步驟的詳細說明
 ```
 
@@ -128,6 +132,7 @@ print(per_type_recall(ft_test, scores_test, tau))
 | [docs/eda.md](docs/eda.md) | 分布對比、分離度、空間 pattern、假設 H1–H4 | §4 |
 | [docs/tier1.md](docs/tier1.md) | Tier 1 設計與結果、**`evaluate.py` 用法** | §5–§7 |
 | [docs/preprocessing.md](docs/preprocessing.md) | resize 方式、品質檢查、**載入方式與表示法選擇** | §5–§6 |
+| [docs/tier2.md](docs/tier2.md) | Tier 2 設計（合成 defect）、結果、和 Tier 1 的比較、AE ablation | §5–§8 |
 
 ---
 
@@ -137,5 +142,7 @@ print(per_type_recall(ft_test, scores_test, tau))
 2. **只看「壞多少」不夠**：fail rate 單一特徵的 PR-AUC 只有 0.474。它抓得到 Near-full、Random（≥ 99%），但 **Scratch 的偵測率只有 9.2%，和 normal 的誤報率（8.9%）相同**。
 3. **anomaly 是空間 pattern**：加入外圈 / 中心位置的資訊後，Edge-Ring 的 AUROC 從 0.73 升到 0.93，Center 從 0.85 升到 0.95（train split）。
 4. **split 以 lot 分組**：同一批次（lot）的晶圓不會同時出現在 train 和 test，避免 leakage。
+5. **看形狀的 CNN 大幅勝出**：Tier 2 只用正常晶圓加上合成 defect 訓練，PR-AUC 就從 0.474 升到 **0.818**（bootstrap 95% CI 的差距為 [0.348, 0.377]）。Edge-Ring 從 27% 升到 89%，Scratch 從 9% 升到 63%，誤報率則從 8.9% 降到 4.0%。
+6. **重建式 Autoencoder 沒有用**：PR-AUC 0.462，和 Tier 1 差不多。normal 晶圓本身就有隨機壞 die，重建誤差會被這些雜訊淹沒。
 
 ---
