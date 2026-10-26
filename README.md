@@ -7,7 +7,7 @@ NYCU Data Mining HW2 — Anomaly Detection｜Team `<TEAM_ID>`
 | 成員 | 學號 | 負責 |
 |---|---|---|
 | `林哲寧` | `315554018` | 資料檢查、split、EDA、preprocessing、Tier 1 baseline、評估模組、repo |
-| `<NAME>` | `<ID>` | Tier 2 |
+| `賴育德` | `315551152` | Tier 2（合成 defect CNN、Conv AE ablation、和 Tier 1 的比較分析） |
 | `<NAME>` | `<ID>` | Tier 3 |
 
 ---
