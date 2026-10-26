@@ -38,6 +38,12 @@ Outputs (results/tier2/<method>/), same layout as results/tier1/:
     scores_test.csv      index, failureType, label, score_seed*, pred_seed*  (§8 error analysis)
     history_seed*.csv    train loss / val PR-AUC per epoch (training curves)
     model_seed*.pt       best weights (by val PR-AUC)
+    result_seed*.pt      finished seed (metrics, test scores, tau); such seeds are skipped on rerun
+    ckpt_seed*.pt        per-epoch checkpoint of the seed in progress (deleted when it finishes)
+
+If Colab disconnects, rerun the exact same command (same --out): finished seeds are skipped and
+the interrupted seed resumes from its last completed epoch. Use a different --out (or delete the
+folder) to start from scratch, e.g. after changing hyperparameters.
 figures/tier2/synthetic_examples.{png,pdf}: what the synthetic training defects look like.
 """
 import argparse
@@ -297,8 +303,11 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-def train(seed, X_tr, X_val, y_val, args):
-    """Train on normals, keep the epoch with the best val PR-AUC (early stopping)."""
+def train(seed, X_tr, X_val, y_val, args, ckpt_path):
+    """Train on normals, keep the epoch with the best val PR-AUC (early stopping).
+
+    A checkpoint is written to ckpt_path after every epoch; if it exists, training resumes from it.
+    """
     set_seed(seed)
     device = X_tr.device
     amp = device.type == "cuda"
@@ -309,9 +318,25 @@ def train(seed, X_tr, X_val, y_val, args):
     scaler = torch.amp.GradScaler(device.type, enabled=amp)
     print(f"  params: {sum(p.numel() for p in model.parameters()):,}")
 
-    history, best_ap, best_state, best_epoch, bad = [], -1.0, None, 0, 0
+    history, best_ap, best_state, best_epoch, bad, start, fit_before = [], -1.0, None, 0, 0, 1, 0.0
+    if ckpt_path.exists():
+        ck = torch.load(ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(ck["model"])
+        opt.load_state_dict(ck["opt"])
+        sched.load_state_dict(ck["sched"])
+        scaler.load_state_dict(ck["scaler"])
+        torch.set_rng_state(ck["rng_cpu"])
+        if device.type == "cuda" and ck["rng_cuda"] is not None:
+            torch.cuda.set_rng_state(ck["rng_cuda"])
+        history, best_ap, best_state = ck["history"], ck["best_ap"], ck["best_state"]
+        best_epoch, bad, fit_before = ck["best_epoch"], ck["bad"], ck["fit_seconds"]
+        start = len(history) + 1
+        print(f"  resumed from {ckpt_path.name}: epoch {start - 1} done, best val PR-AUC {best_ap:.4f}")
+        if bad >= args.patience:
+            start = args.epochs + 1  # it had already early-stopped
+
     t_start = time.perf_counter()
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start, args.epochs + 1):
         model.train()
         t0 = time.perf_counter()
         perm = torch.randperm(len(X_tr), device=device)
@@ -337,12 +362,19 @@ def train(seed, X_tr, X_val, y_val, args):
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
         else:
             bad += 1
-            if bad >= args.patience:
-                print(f"  early stop: no val improvement for {args.patience} epochs")
-                break
+        torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(),
+                    "scaler": scaler.state_dict(), "rng_cpu": torch.get_rng_state(),
+                    "rng_cuda": torch.cuda.get_rng_state() if device.type == "cuda" else None,
+                    "history": history, "best_ap": best_ap, "best_state": best_state,
+                    "best_epoch": best_epoch, "bad": bad,
+                    "fit_seconds": fit_before + time.perf_counter() - t_start}, ckpt_path)
+        if bad >= args.patience:
+            print(f"  early stop: no val improvement for {args.patience} epochs")
+            break
 
     model.load_state_dict(best_state)
-    return model, pd.DataFrame(history), best_epoch, best_ap, time.perf_counter() - t_start
+    fit_seconds = fit_before + time.perf_counter() - t_start
+    return model, pd.DataFrame(history), best_epoch, best_ap, fit_seconds
 
 
 def save_synthetic_examples(X_normal, path, seed=0):
@@ -430,19 +462,28 @@ def main():
     scores_df = pd.DataFrame({"index": idx_test, "failureType": ft_test, "label": y_test})
     for seed in args.seeds:
         print(f"\n=== seed {seed} ===")
-        model, history, best_epoch, best_val_ap, fit_seconds = train(seed, X_tr_t, X_val_t, y_val, args)
-        history.to_csv(out / f"history_seed{seed}.csv", index=False, float_format="%.4f")
-        torch.save(model.state_dict(), out / f"model_seed{seed}.pt")
+        done_path = out / f"result_seed{seed}.pt"
+        if done_path.exists():  # finished in an earlier (interrupted) run
+            m, scores_test, tau = torch.load(done_path, weights_only=False)
+            print(f"  already done, loaded {done_path.name}")
+        else:
+            ckpt_path = out / f"ckpt_seed{seed}.pt"
+            model, history, best_epoch, best_val_ap, fit_seconds = train(seed, X_tr_t, X_val_t, y_val, args, ckpt_path)
+            history.to_csv(out / f"history_seed{seed}.csv", index=False, float_format="%.4f")
+            torch.save(model.state_dict(), out / f"model_seed{seed}.pt")
 
-        # tau on VAL only, then TEST scored exactly once
-        tau = find_best_f1_threshold(y_val, score_all(model, X_val_t, args, tta=args.tta))
-        t0 = time.perf_counter()
-        scores_test = score_all(model, X_test_t, args, tta=args.tta)
-        ms_per_sample = (time.perf_counter() - t0) * 1000 / len(X_test)
+            # tau on VAL only, then TEST scored exactly once
+            tau = find_best_f1_threshold(y_val, score_all(model, X_val_t, args, tta=args.tta))
+            t0 = time.perf_counter()
+            scores_test = score_all(model, X_test_t, args, tta=args.tta)
+            ms_per_sample = (time.perf_counter() - t0) * 1000 / len(X_test)
 
-        m = evaluate(y_test, scores_test, tau)
-        m.update({"method": f"{name}_seed{seed}", "seed": seed, "best_epoch": best_epoch,
-                  "val_pr_auc": best_val_ap, "ms_per_sample": ms_per_sample, "fit_seconds": fit_seconds})
+            m = evaluate(y_test, scores_test, tau)
+            m.update({"method": f"{name}_seed{seed}", "seed": seed, "best_epoch": best_epoch,
+                      "val_pr_auc": best_val_ap, "ms_per_sample": ms_per_sample, "fit_seconds": fit_seconds})
+            torch.save((m, scores_test, tau), done_path)
+            ckpt_path.unlink()  # the per-epoch checkpoint is no longer needed
+        best_epoch = m["best_epoch"]
         rows.append(m)
         recalls[f"seed{seed}"] = per_type_recall(ft_test, scores_test, tau)["rate"]
         scores_df[f"score_seed{seed}"] = scores_test
