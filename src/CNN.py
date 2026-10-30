@@ -24,6 +24,17 @@ Methods
   ae               T2_conv_ae   : convolutional autoencoder (ablation, pure reconstruction).
                                   Score = per-pixel CE inside the wafer, avg-pooled, top-k mean,
                                   so clustered errors (patterns) outweigh scattered random fails.
+  resnet           T3_resnet18  : Tier 3 reference. ImageNet-pretrained ResNet-18 fine-tuned
+                                  SUPERVISED on all train wafers with the real 9-class labels.
+  sup              T3_sup_cnn   : control for Tier 3: the Tier 2 architecture (WaferCNN) trained
+                                  supervised on real labels, i.e. only the supervision changes.
+  All methods share the score s(x) (log-odds of "any defect" vs "none" for the classifiers),
+  the tau rule (best F1 on val) and evaluate.py. Default --out: results/tier2 or results/tier3.
+
+Ablation switches (synth only, one factor at a time; use a separate --out per setting):
+  --contam F       a share F of the training pool is real train defects, unlabeled (as "none")
+  --drop-types T   never synthesize these defect types (leave-one-type-out)
+  --binary         2-way head (none vs any synthetic defect) instead of the 9-way head
 
 Colab (Runtime -> Change runtime type -> GPU):
     !git clone https://github.com/justinlin9299/DM-HW2.git
@@ -47,6 +58,7 @@ folder) to start from scratch, e.g. after changing hyperparameters.
 figures/tier2/synthetic_examples.{png,pdf}: what the synthetic training defects look like.
 """
 import argparse
+import json
 import math
 import time
 from pathlib import Path
@@ -63,7 +75,8 @@ from evaluate import evaluate, find_best_f1_threshold, per_type_recall
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFECT_TYPES = ["Center", "Donut", "Edge-Loc", "Edge-Ring", "Loc", "Near-full", "Random", "Scratch"]
-METHOD_NAMES = {"synth": "T2_cnn_synth", "ae": "T2_conv_ae"}
+METHOD_NAMES = {"synth": "T2_cnn_synth", "ae": "T2_conv_ae", "resnet": "T3_resnet18", "sup": "T3_sup_cnn"}
+SUPERVISED = ("resnet", "sup")
 
 
 # ---- synthetic defects ---------------------------------------------------------------------
@@ -233,6 +246,26 @@ class WaferCNN(nn.Module):
         return torch.logsumexp(logits[:, 1:], 1) - logits[:, 0]
 
 
+class ResNet18(nn.Module):
+    """Tier 3: torchvision ResNet-18 (He et al., 2016), ImageNet weights, new 9-way head.
+
+    The 64x64 one-hot map is upsampled (nearest) to 128x128 so that the stride-32 backbone
+    still ends on a 4x4 feature map. Same score as WaferCNN.
+    """
+
+    def __init__(self, n_classes=1 + len(DEFECT_TYPES), size=128, pretrained=True):
+        super().__init__()
+        from torchvision.models import ResNet18_Weights, resnet18
+        self.net = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1 if pretrained else None)
+        self.net.fc = nn.Linear(self.net.fc.in_features, n_classes)
+        self.size = size
+
+    def forward(self, x):
+        return self.net(F.interpolate(x, size=self.size, mode="nearest"))
+
+    score = WaferCNN.score
+
+
 class ConvAE(nn.Module):
     """Convolutional autoencoder, 64x64x3 -> latent -> 64x64x3 logits (ablation)."""
 
@@ -263,22 +296,37 @@ class ConvAE(nn.Module):
 
 
 def build_model(args):
-    if args.method == "synth":
-        return WaferCNN(widths=tuple(args.widths or (16, 32, 64, 128)))
+    if args.method == "resnet":
+        return ResNet18()
+    if args.method in ("synth", "sup"):
+        n_classes = 2 if args.binary else 1 + len(DEFECT_TYPES)
+        return WaferCNN(widths=tuple(args.widths or (16, 32, 64, 128)), n_classes=n_classes)
     return ConvAE(widths=tuple(args.widths or (32, 64, 128)), latent=args.latent,
                   pool=args.ae_pool, topk=args.ae_topk)
 
 
 # ---- training / scoring ---------------------------------------------------------------------
 
-def make_batch(xb, args):
-    """Normal wafers -> (model input, target). Only train normals ever enter here."""
+def make_batch(xb, args, yb=None):
+    """Training wafers -> (model input, target).
+
+    synth / ae: only train normals (plus --contam unlabeled defects) ever enter here.
+    resnet / sup (Tier 3): real wafers with their real 9-class label yb.
+    """
     xb = random_dihedral(xb)
+    if args.method in SUPERVISED:
+        return onehot(xb), yb
     if args.method == "synth":
         n_syn = int(len(xb) * args.synth_frac)
         types = torch.zeros(len(xb), dtype=torch.long, device=xb.device)
-        types[:n_syn] = torch.randint(1, len(DEFECT_TYPES) + 1, (n_syn,), device=xb.device)
-        return onehot(synthesize(xb, types)), types
+        if args.drop_types:
+            allowed = torch.tensor([i + 1 for i, t in enumerate(DEFECT_TYPES) if t not in args.drop_types],
+                                   device=xb.device)
+            types[:n_syn] = allowed[torch.randint(0, len(allowed), (n_syn,), device=xb.device)]
+        else:
+            types[:n_syn] = torch.randint(1, len(DEFECT_TYPES) + 1, (n_syn,), device=xb.device)
+        target = (types > 0).long() if args.binary else types
+        return onehot(synthesize(xb, types)), target
     return onehot(xb), xb.long()
 
 
@@ -303,8 +351,10 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-def train(seed, X_tr, X_val, y_val, args, ckpt_path):
-    """Train on normals, keep the epoch with the best val PR-AUC (early stopping).
+def train(seed, X_tr, X_val, y_val, args, ckpt_path, y_tr=None):
+    """Train, keep the epoch with the best val PR-AUC (early stopping).
+
+    y_tr (real 9-class labels) is only given for the supervised Tier 3 methods.
 
     A checkpoint is written to ckpt_path after every epoch; if it exists, training resumes from it.
     """
@@ -342,7 +392,8 @@ def train(seed, X_tr, X_val, y_val, args, ckpt_path):
         perm = torch.randperm(len(X_tr), device=device)
         total = torch.zeros((), device=device)
         for s in range(steps):
-            inputs, target = make_batch(X_tr[perm[s * args.batch_size:(s + 1) * args.batch_size]], args)
+            bi = perm[s * args.batch_size:(s + 1) * args.batch_size]
+            inputs, target = make_batch(X_tr[bi], args, None if y_tr is None else y_tr[bi])
             with torch.autocast(device.type, dtype=torch.float16, enabled=amp):
                 loss = F.cross_entropy(model(inputs), target)
             opt.zero_grad(set_to_none=True)
@@ -405,92 +456,11 @@ def save_synthetic_examples(X_normal, path, seed=0):
     plt.close(fig)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--method", choices=["synth", "ae"], default="synth")
-    parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--patience", type=int, default=5, help="early stopping on val PR-AUC")
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--widths", type=int, nargs="+", default=None,
-                        help="conv widths (default synth: 16 32 64 128, ae: 32 64 128)")
-    parser.add_argument("--synth-frac", type=float, default=0.5, help="share of each batch turned into synthetic defects")
-    parser.add_argument("--latent", type=int, default=64, help="ae only")
-    parser.add_argument("--ae-pool", type=int, default=5, help="ae only: avg-pool size of the error map")
-    parser.add_argument("--ae-topk", type=int, default=16, help="ae only: mean of the k largest pooled errors")
-    parser.add_argument("--tta", action="store_true", help="average the score over 8 flips/rotations")
-    parser.add_argument("--eval-batch", type=int, default=1024)
-    parser.add_argument("--limit", type=int, default=None, help="DEBUG ONLY: subsample every split to N wafers")
-    parser.add_argument("--out", type=Path, default=ROOT / "results" / "tier2")
-    args = parser.parse_args()
+def save_results(rows, recalls, scores_df, name, out, ft_test):
+    """Write metrics.csv (seeds + mean + std), per_type_recall.csv and scores_test.csv.
 
-    name = METHOD_NAMES[args.method]
-    out = args.out / (args.method + ("_debug" if args.limit else ""))
-    out.mkdir(parents=True, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"{name} on {device}" + (f" ({torch.cuda.get_device_name()})" if device.type == "cuda" else ""))
-    torch.backends.cudnn.benchmark = True
-
-    X_train, y_train, _, _ = load_split("train")
-    X_val, y_val, _, _ = load_split("val")
-    X_test, y_test, ft_test, idx_test = load_split("test")
-    X_train_normal = X_train[y_train == 0]  # Tier 2: train normals only
-    del X_train
-
-    if args.limit:
-        print(f"WARNING: --limit {args.limit} is for debugging; results go to {out} and are not reportable")
-        rng = np.random.default_rng(0)
-        X_train_normal = X_train_normal[rng.choice(len(X_train_normal), min(args.limit, len(X_train_normal)), replace=False)]
-        keep = rng.choice(len(X_val), min(args.limit, len(X_val)), replace=False)
-        X_val, y_val = X_val[keep], y_val[keep]
-        keep = rng.choice(len(X_test), min(args.limit, len(X_test)), replace=False)
-        X_test, y_test, ft_test, idx_test = X_test[keep], y_test[keep], ft_test[keep], idx_test[keep]
-    print(f"train normals {len(X_train_normal):,} | val {len(X_val):,} | test {len(X_test):,}")
-
-    if args.method == "synth":
-        fig_path = (out if args.limit else ROOT / "figures" / "tier2") / "synthetic_examples"
-        save_synthetic_examples(X_train_normal, fig_path)
-        print(f"saved {fig_path}.png")
-
-    X_tr_t = torch.from_numpy(X_train_normal).to(device)
-    X_val_t = torch.from_numpy(X_val).to(device)
-    X_test_t = torch.from_numpy(X_test).to(device)
-
-    rows, recalls = [], {}
-    scores_df = pd.DataFrame({"index": idx_test, "failureType": ft_test, "label": y_test})
-    for seed in args.seeds:
-        print(f"\n=== seed {seed} ===")
-        done_path = out / f"result_seed{seed}.pt"
-        if done_path.exists():  # finished in an earlier (interrupted) run
-            m, scores_test, tau = torch.load(done_path, weights_only=False)
-            print(f"  already done, loaded {done_path.name}")
-        else:
-            ckpt_path = out / f"ckpt_seed{seed}.pt"
-            model, history, best_epoch, best_val_ap, fit_seconds = train(seed, X_tr_t, X_val_t, y_val, args, ckpt_path)
-            history.to_csv(out / f"history_seed{seed}.csv", index=False, float_format="%.4f")
-            torch.save(model.state_dict(), out / f"model_seed{seed}.pt")
-
-            # tau on VAL only, then TEST scored exactly once
-            tau = find_best_f1_threshold(y_val, score_all(model, X_val_t, args, tta=args.tta))
-            t0 = time.perf_counter()
-            scores_test = score_all(model, X_test_t, args, tta=args.tta)
-            ms_per_sample = (time.perf_counter() - t0) * 1000 / len(X_test)
-
-            m = evaluate(y_test, scores_test, tau)
-            m.update({"method": f"{name}_seed{seed}", "seed": seed, "best_epoch": best_epoch,
-                      "val_pr_auc": best_val_ap, "ms_per_sample": ms_per_sample, "fit_seconds": fit_seconds})
-            torch.save((m, scores_test, tau), done_path)
-            ckpt_path.unlink()  # the per-epoch checkpoint is no longer needed
-        best_epoch = m["best_epoch"]
-        rows.append(m)
-        recalls[f"seed{seed}"] = per_type_recall(ft_test, scores_test, tau)["rate"]
-        scores_df[f"score_seed{seed}"] = scores_test
-        scores_df[f"pred_seed{seed}"] = (scores_test >= tau).astype(int)
-        print(f"  test PR-AUC {m['pr_auc']:.4f}  ROC-AUC {m['roc_auc']:.4f}  F1 {m['f1']:.4f}"
-              f"  recall {m['recall']:.4f}  FPR {m['fpr']:.4f}  (tau {tau:.4f}, best epoch {best_epoch})")
-
+    Shared by every method so that compare.py / ablation.py can read them the same way.
+    """
     cols = ["pr_auc", "roc_auc", "f1", "precision", "recall", "fpr", "accuracy", "tau",
             "tp", "fp", "fn", "tn", "ms_per_sample", "fit_seconds", "best_epoch", "val_pr_auc"]
     metrics = pd.DataFrame(rows).set_index("method")[cols]
@@ -513,6 +483,118 @@ def main():
     print("Per-type detection rate on test ('none' row = false alarm rate)")
     print(per_type.loc[order].round(3).to_string(), "\n")
     print(f"Saved results to {out}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--method", choices=list(METHOD_NAMES), default="synth")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--patience", type=int, default=5, help="early stopping on val PR-AUC")
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--widths", type=int, nargs="+", default=None,
+                        help="conv widths (default synth: 16 32 64 128, ae: 32 64 128)")
+    parser.add_argument("--synth-frac", type=float, default=0.5, help="share of each batch turned into synthetic defects")
+    parser.add_argument("--latent", type=int, default=64, help="ae only")
+    parser.add_argument("--ae-pool", type=int, default=5, help="ae only: avg-pool size of the error map")
+    parser.add_argument("--ae-topk", type=int, default=16, help="ae only: mean of the k largest pooled errors")
+    parser.add_argument("--contam", type=float, default=0.0,
+                        help="ablation: share of the training pool that is unlabeled real train defects")
+    parser.add_argument("--drop-types", nargs="+", default=[], choices=DEFECT_TYPES,
+                        help="ablation: defect types that are never synthesized")
+    parser.add_argument("--binary", action="store_true", help="ablation: none-vs-defect head instead of 9-way")
+    parser.add_argument("--tta", action="store_true", help="average the score over 8 flips/rotations")
+    parser.add_argument("--eval-batch", type=int, default=1024)
+    parser.add_argument("--limit", type=int, default=None, help="DEBUG ONLY: subsample every split to N wafers")
+    parser.add_argument("--out", type=Path, default=None, help="default: results/tier2, or results/tier3 for resnet / sup")
+    args = parser.parse_args()
+    if args.out is None:
+        args.out = ROOT / "results" / ("tier3" if args.method in SUPERVISED else "tier2")
+    ablation = args.contam > 0 or args.drop_types or args.binary
+
+    name = METHOD_NAMES[args.method]
+    out = args.out / (args.method + ("_debug" if args.limit else ""))
+    out.mkdir(parents=True, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"{name} on {device}" + (f" ({torch.cuda.get_device_name()})" if device.type == "cuda" else ""))
+    torch.backends.cudnn.benchmark = True
+
+    X_train, y_train, ft_train, _ = load_split("train")
+    X_val, y_val, _, _ = load_split("val")
+    X_test, y_test, ft_test, idx_test = load_split("test")
+    X_train_normal = X_train[y_train == 0]  # Tier 2: train normals only
+    if args.method in SUPERVISED:  # Tier 3: every train wafer with its real 9-class label
+        X_train_normal = X_train
+        y_train_cls = np.array([0 if t == "none" else DEFECT_TYPES.index(t) + 1 for t in ft_train])
+    elif args.contam > 0:  # ablation: real defects hidden in the "normal" training pool
+        defects = X_train[y_train == 1]
+        n_c = int(round(args.contam / (1 - args.contam) * len(X_train_normal)))
+        pick = np.random.default_rng(0).choice(len(defects), n_c, replace=False)
+        X_train_normal = np.concatenate([X_train_normal, defects[pick]])
+        print(f"contamination: {n_c:,} unlabeled train defects in the pool ({args.contam:.1%})")
+    del X_train
+
+    if args.limit:
+        print(f"WARNING: --limit {args.limit} is for debugging; results go to {out} and are not reportable")
+        rng = np.random.default_rng(0)
+        keep = rng.choice(len(X_train_normal), min(args.limit, len(X_train_normal)), replace=False)
+        X_train_normal = X_train_normal[keep]
+        if args.method in SUPERVISED:
+            y_train_cls = y_train_cls[keep]
+        keep = rng.choice(len(X_val), min(args.limit, len(X_val)), replace=False)
+        X_val, y_val = X_val[keep], y_val[keep]
+        keep = rng.choice(len(X_test), min(args.limit, len(X_test)), replace=False)
+        X_test, y_test, ft_test, idx_test = X_test[keep], y_test[keep], ft_test[keep], idx_test[keep]
+    print(f"train pool {len(X_train_normal):,} | val {len(X_val):,} | test {len(X_test):,}")
+
+    if args.method == "synth" and not ablation:
+        fig_path = (out if args.limit else ROOT / "figures" / "tier2") / "synthetic_examples"
+        save_synthetic_examples(X_train_normal, fig_path)
+        print(f"saved {fig_path}.png")
+
+    X_tr_t = torch.from_numpy(X_train_normal).to(device)
+    y_tr_t = torch.from_numpy(y_train_cls).to(device) if args.method in SUPERVISED else None
+    (out / "config.json").write_text(json.dumps({k: str(v) if isinstance(v, Path) else v
+                                                 for k, v in vars(args).items()}, indent=1))
+    X_val_t = torch.from_numpy(X_val).to(device)
+    X_test_t = torch.from_numpy(X_test).to(device)
+
+    rows, recalls = [], {}
+    scores_df = pd.DataFrame({"index": idx_test, "failureType": ft_test, "label": y_test})
+    for seed in args.seeds:
+        print(f"\n=== seed {seed} ===")
+        done_path = out / f"result_seed{seed}.pt"
+        if done_path.exists():  # finished in an earlier (interrupted) run
+            m, scores_test, tau = torch.load(done_path, weights_only=False)
+            print(f"  already done, loaded {done_path.name}")
+        else:
+            ckpt_path = out / f"ckpt_seed{seed}.pt"
+            model, history, best_epoch, best_val_ap, fit_seconds = train(seed, X_tr_t, X_val_t, y_val, args, ckpt_path, y_tr_t)
+            history.to_csv(out / f"history_seed{seed}.csv", index=False, float_format="%.4f")
+            torch.save(model.state_dict(), out / f"model_seed{seed}.pt")
+
+            # tau on VAL only, then TEST scored exactly once
+            tau = find_best_f1_threshold(y_val, score_all(model, X_val_t, args, tta=args.tta))
+            t0 = time.perf_counter()
+            scores_test = score_all(model, X_test_t, args, tta=args.tta)
+            ms_per_sample = (time.perf_counter() - t0) * 1000 / len(X_test)
+
+            m = evaluate(y_test, scores_test, tau)
+            m.update({"method": f"{name}_seed{seed}", "seed": seed, "best_epoch": best_epoch,
+                      "val_pr_auc": best_val_ap, "ms_per_sample": ms_per_sample, "fit_seconds": fit_seconds})
+            torch.save((m, scores_test, tau), done_path)
+            ckpt_path.unlink()  # the per-epoch checkpoint is no longer needed
+        best_epoch = m["best_epoch"]
+        rows.append(m)
+        recalls[f"seed{seed}"] = per_type_recall(ft_test, scores_test, tau)["rate"]
+        scores_df[f"score_seed{seed}"] = scores_test
+        scores_df[f"pred_seed{seed}"] = (scores_test >= tau).astype(int)
+        print(f"  test PR-AUC {m['pr_auc']:.4f}  ROC-AUC {m['roc_auc']:.4f}  F1 {m['f1']:.4f}"
+              f"  recall {m['recall']:.4f}  FPR {m['fpr']:.4f}  (tau {tau:.4f}, best epoch {best_epoch})")
+
+    save_results(rows, recalls, scores_df, name, out, ft_test)
 
 
 if __name__ == "__main__":

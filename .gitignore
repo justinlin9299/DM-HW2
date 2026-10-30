@@ -8,6 +8,7 @@ data/*.zip
 
 # Course material (not ours to redistribute)
 DM-HW2.pptx
+DM-HW2.pdf
 
 # Python / Jupyter
 __pycache__/
@@ -21,3 +22,21 @@ venv/
 Thumbs.db
 .vscode/
 .idea/
+
+# Model weights / checkpoints of Tier 3 and the ablations: reproducible with
+# scripts/run_tier3_ablation.sh (~30 min on one GPU). Tier 2's weights stay in the repo.
+results/**/result_seed*.pt
+results/**/ckpt_seed*.pt
+results/tier3/**/*.pt
+results/ablation/**/*.pt
+results/**/*.log
+# Per-run extras of Tier 3 / ablations that no script reads (the run arguments are in
+# scripts/run_tier3_ablation.sh). Kept: metrics.csv everywhere, and every scores_test.csv
+# that compare.py / ablation.py read.
+results/tier3/**/history_seed*.csv
+results/tier3/**/config.json
+results/ablation/**/history_seed*.csv
+results/ablation/**/config.json
+results/ablation/**/per_type_recall.csv
+results/ablation/contam_*/synth/scores_test.csv
+results/ablation/binary/synth/scores_test.csv
