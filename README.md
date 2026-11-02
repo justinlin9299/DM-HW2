@@ -35,11 +35,12 @@ NYCU Data Mining HW2 — Anomaly Detection｜Team `<TEAM_ID>`
 | 1 | Fail-rate threshold（τ = val best-F1） | 0.474 | 0.748 | 0.423 | 0.407 | 0.089 |
 | 2 | CNN＋合成 defect（只用 train normal） | 0.818 ± 0.014 | 0.934 ± 0.009 | 0.748 ± 0.008 | 0.735 ± 0.013 | 0.040 ± 0.005 |
 | 2 | ablation：Conv Autoencoder | 0.462 ± 0.048 | 0.703 ± 0.047 | 0.428 ± 0.049 | 0.339 ± 0.059 | 0.041 ± 0.009 |
+| 2 | 比較：Isolation Forest（手工空間特徵，只用 train normal） | 0.685 ± 0.012 | 0.907 ± 0.006 | 0.611 ± 0.013 | 0.637 ± 0.007 | 0.078 ± 0.010 |
 | 3 | PatchCore（one-class SOTA，只用 train normal） | 0.812 ± 0.005 | 0.932 ± 0.002 | 0.725 ± 0.005 | 0.693 ± 0.023 | 0.038 ± 0.005 |
 | 3 | ResNet-18 監督式（真實 9 類 label，上限） | **0.991 ± 0.000** | **0.998 ± 0.000** | **0.953 ± 0.001** | **0.946 ± 0.002** | **0.007 ± 0.000** |
 | 3 | control：Tier 2 的 CNN 改用監督式 | 0.988 ± 0.000 | 0.997 ± 0.000 | 0.944 ± 0.002 | 0.929 ± 0.004 | 0.007 ± 0.000 |
 
-Test set：34,493 片（29,397 normal / 5,096 anomaly）。Tier 2 / 3 為 3 個 seed 的 mean ± std，τ 一律在 val 上以 best-F1 選擇。T2 vs PatchCore：+0.006（bootstrap 95% CI [−0.003, +0.015]，p = 0.62，無顯著差異）；監督式 ResNet-18 − T2：+0.173（CI [0.164, 0.181]，p = 0.003）。詳見 [docs/tier1.md](docs/tier1.md)、[docs/tier2.md](docs/tier2.md)、[docs/tier3.md](docs/tier3.md)；ablation 見 [docs/ablation.md](docs/ablation.md)。
+Test set：34,493 片（29,397 normal / 5,096 anomaly）。Tier 2 / 3 為 3 個 seed 的 mean ± std，τ 一律在 val 上以 best-F1 選擇。T2 vs PatchCore：+0.006（bootstrap 95% CI [−0.003, +0.015]，p = 0.62，無顯著差異）；監督式 ResNet-18 − T2：+0.173（CI [0.164, 0.181]，p = 0.003）；T2 − Isolation Forest：+0.133（CI [0.121, 0.144]，p = 0.0006）。詳見 [docs/tier1.md](docs/tier1.md)、[docs/tier2.md](docs/tier2.md)、[docs/tier3.md](docs/tier3.md)；ablation 見 [docs/ablation.md](docs/ablation.md)。
 
 ---
 
@@ -105,6 +106,7 @@ print(per_type_recall(ft_test, scores_test, tau))
 │   ├── evaluate.py            # 共用評估函式（三個 tier 都要用）
 │   ├── tier1_baseline.py      # Tier 1
 │   ├── CNN.py                 # Tier 2 / Tier 3 監督式 / ablation 的訓練（GPU）
+│   ├── iforest.py             # 比較方法：Isolation Forest（手工空間特徵，one-class）
 │   ├── patchcore.py           # Tier 3 PatchCore（one-class）
 │   ├── compare.py             # 三個 tier 的主結果表 + 顯著性檢定
 │   └── ablation.py            # ablation 總表、threshold ablation、圖
@@ -143,6 +145,7 @@ print(per_type_recall(ft_test, scores_test, tau))
 | [docs/tier1.md](docs/tier1.md) | Tier 1 設計與結果、**`evaluate.py` 用法** | §5–§7 |
 | [docs/preprocessing.md](docs/preprocessing.md) | resize 方式、品質檢查、**載入方式與表示法選擇** | §5–§6 |
 | [docs/tier2.md](docs/tier2.md) | Tier 2 設計（合成 defect）、結果、和 Tier 1 的比較、AE ablation | §5–§8 |
+| [docs/iforest.md](docs/iforest.md) | 比較方法：Isolation Forest（手工空間特徵）的設計、結果、和 T1 / T2 的比較 | §5–§7 |
 | [docs/tier3.md](docs/tier3.md) | Tier 3 PatchCore ＋ 監督式 ResNet-18、三個 tier 主結果表、顯著性、比較解讀 | §2、§5–§7 |
 | [docs/ablation.md](docs/ablation.md) | 4 個 controlled ablation：污染、leave-one-type-out、head、threshold | §7–§9 |
 

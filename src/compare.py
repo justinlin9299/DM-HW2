@@ -27,12 +27,15 @@ OUT = RES / "compare"
 METHODS = [
     ("T1 Fail-rate (best-F1)", RES / "tier1", "T1b_failrate_bestF1", "score_failrate"),
     ("T2 CNN + synthetic defects", RES / "tier2" / "synth", "T2_cnn_synth_seed", "score_seed"),
+    ("Isolation Forest (handcrafted)", RES / "iforest", "IF_seed", "score_seed"),
     ("T3 PatchCore (one-class)", RES / "tier3" / "patchcore", "T3_patchcore_seed", "score_seed"),
     ("T3 ResNet-18 (supervised)", RES / "tier3" / "resnet", "T3_resnet18_seed", "score_seed"),
     ("T3 control: T2 CNN (supervised)", RES / "tier3" / "sup", "T3_sup_cnn_seed", "score_seed"),
 ]
 PAIRS = [  # (a, b): gap = PR-AUC(a) - PR-AUC(b)
     ("T2 CNN + synthetic defects", "T1 Fail-rate (best-F1)"),
+    ("Isolation Forest (handcrafted)", "T1 Fail-rate (best-F1)"),
+    ("T2 CNN + synthetic defects", "Isolation Forest (handcrafted)"),
     ("T2 CNN + synthetic defects", "T3 PatchCore (one-class)"),
     ("T3 ResNet-18 (supervised)", "T2 CNN + synthetic defects"),
     ("T3 control: T2 CNN (supervised)", "T2 CNN + synthetic defects"),
